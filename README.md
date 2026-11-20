@@ -12,8 +12,9 @@
 2. 阅读文集：创建/修改来源说明、查看样本、用真实业务字段追加记录；列表分页。
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
-5. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+5. 接续剔除：对提升度>1的接续，搜索使提升度降到1或以下的最少完整会话剔除方案；受理时冻结文集，分批处理，时限内给已证下界与可复算方案，证完才报最少或无解。
+6. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
 
 ## 快速启动
 
@@ -53,7 +54,7 @@ JWT有效期8小时；PBKDF2盐化哈希保存密码；角色每请求从数据�
 
 ## 实体与字段
 
-ReadingCollection / ReadingSession / TransitionRun / EditorialPlan 是核心实体；另有User和Audit。数据库实际表：`reading_collections` → `reading_sessions` → `transition_runs` → `editorial_plans`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：匿名会话编号（`session`）、章节路径（用 > 分隔）（`path`）。
+ReadingCollection / ReadingSession / TransitionRun / EditorialPlan / PruneTask 是核心实体；另有User和Audit。数据库实际表：`reading_collections` → `reading_sessions` → `transition_runs` → `editorial_plans`，剔除搜索任务存 `prune_tasks`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：匿名会话编号（`session`）、章节路径（用 > 分隔）（`path`）。
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
 
@@ -65,6 +66,16 @@ ReadingCollection / ReadingSession / TransitionRun / EditorialPlan 是核心实�
 - `top_n`：保留接续规则数，默认 `20`。
 
 只统计同一会话内的相邻章节；提升度相对于所有接续边的目标章节基率，关联不代表编辑调整造成的因果效果。
+
+## 接续剔除搜索口径
+
+对一条提升度>1的接续 a→b，求：最少剔除哪些完整会话，按剩余路径重算后提升度≤1。全部计算位于 `backend/src/services/prune_solver.py`（纯标准库，可独立复算），任务编排位于 `services/prune.py`。
+
+- 判定全程整数化：提升度≤1 ⟺ `接续次数×总边数 ≤ 起点出边×终点入边`，无浮点误差；接续消失（剩余次数<`min_remaining`，默认1）不算翻转。
+- 受理时把来源全部会话冻结为JSONL（SHA256校验，原样本不动）；十万会话分批扫描聚合；搜索按时间片推进并落盘已证进度。
+- 约定时限（`time_limit_sec`，默认60秒）到了就报告已证下界与当前最佳可复算方案（`timeout`）；只有证明完成才报告最少（`optimal`）或无解（`infeasible`）。
+- 中断后沿原输入（校验和一致才继续）与已证搜索进度恢复；worker心跳过期任务自动重新入队；并发重试经 `seq` 乐观锁保护，较旧的写不覆盖较新的搜索结果。
+- 结果页列出搜索状态、上下界与剔除会话；剔除清单CSV可下载，配合冻结输入用 `python -m scripts.prune_cli 输入.jsonl 起点 终点 --verify 清单.csv` 独立复算。
 
 失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
 
@@ -82,6 +93,8 @@ ReadingCollection / ReadingSession / TransitionRun / EditorialPlan 是核心实�
 6. 09:25 分析师查看专属诊断及逐行结果，并下载CSV复算。
 7. 09:30 提交“十一月业务复核意见”，负责人核对并批准。
 8. 09:40 viewer下载批准快照，查看审计中的worker完成与批准事件。
+9. 09:45 分析师在“接续剔除”对首轮提升度最高的接续发起搜索：受理即冻结文集，worker分批扫描后按时间片证明；页面列出搜索状态、上下界与剔除会话，证完显示“已证最少”。
+10. 09:50 下载剔除清单CSV，用 `prune_cli --verify` 在冻结输入上复算翻转成立。
 
 ## 目录与本地开发
 
@@ -89,6 +102,7 @@ ReadingCollection / ReadingSession / TransitionRun / EditorialPlan 是核心实�
 frontend/src/api, stores, types, components/common, hooks, pages, router, utils, constants
 backend/src/routes, controllers, services, models, schemas, middlewares, utils, constants, config
 backend/scripts/seed_demo.py
+backend/scripts/prune_cli.py        # 接续剔除独立复算 CLI
 backend/migrations/001_initial.sql
 ```
 
@@ -105,4 +119,4 @@ backend/migrations/001_initial.sql
 
 共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
-测试及截图在批根 `test-artifacts/gb-0043/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+测试及截图在批根 `test-artifacts/gb-0043/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。接续剔除求解器的oracle对拍、十万会话分批基准与并发协议模拟在 `test-artifacts/gb-0043/prune/`（纯标准库，`python3 -I test_prune_solver.py`）。License：MIT。

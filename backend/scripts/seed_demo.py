@@ -1,4 +1,5 @@
 import json,random,logging
+from types import SimpleNamespace
 from sqlalchemy import select,func
 from src.config.database import Base,engine,Session
 from src.config.settings import CONFIG
@@ -6,11 +7,14 @@ from src.models.user import User
 from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
+from src.models.prune import PruneTask
 from src.models import note,audit
 from src.utils.security import hash_password
 from src.utils.serialization import now
 from src.services.runs import queue
 from src.services.domain_validation import validate_record
+from src.services.algorithm import calculate
+from src.services import prune as prune_service
 
 def seed_values(kind,index,batch,rng):
     if kind=='gaussian':
@@ -32,6 +36,22 @@ def seed_values(kind,index,batch,rng):
 
 def counts(db):
     return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in (User,Source,Record,Run)}
+def seed_prune(db):
+    """首轮接续剔除演示：取种子数据中提升度最高的达标接续，冻结文集并创建搜索任务。
+    幂等：同名任务已存在则跳过；失败仅记录日志，不阻塞服务启动。"""
+    if db.scalar(select(PruneTask.id).where(PruneTask.name=='首轮接续剔除搜索')):
+        return
+    source=db.scalar(select(Source).where(Source.key==CONFIG['code']+'-202611-01'))
+    if not source:return
+    records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
+    result=calculate(records,CONFIG['default_parameters'])
+    if not result['rows']:return
+    top=result['rows'][0]
+    data=SimpleNamespace(source_id=source.id,name='首轮接续剔除搜索',target_from=top['from'],target_to=top['to'],
+                         parameters={'time_limit_sec':60,'batch_size':5000,'min_remaining':1})
+    prune_service.create_task(db,'seed',data)
+    print(json.dumps({'prune_demo':{'target':top['from']+'->'+top['to'],'lift':round(top['lift'],4)}},ensure_ascii=False))
+
 def seed():
     Base.metadata.create_all(engine);rng=random.Random(42);queued=[]
     with Session() as db:
@@ -53,6 +73,8 @@ def seed():
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
+        try:seed_prune(db)
+        except Exception:logging.exception('prune demo seed skipped')
     for id in queued:
         try:queue.rpush('analysis:queue',id)
         except Exception:logging.exception('seed queue unavailable')
